@@ -68,4 +68,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
     content=summaries,
     content_rowid=rowid
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(
+    content,
+    content=messages,
+    content_rowid=id,
+    tokenize='trigram'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts_cjk USING fts5(
+    content,
+    content=summaries,
+    content_rowid=rowid,
+    tokenize='trigram'
+);
 `

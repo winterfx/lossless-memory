@@ -62,6 +62,13 @@ func (s *Store) InsertMessage(m *Message) (int64, error) {
 		return 0, fmt.Errorf("updating messages_fts: %w", err)
 	}
 
+	// Update CJK trigram FTS index
+	if _, err := tx.Exec(
+		"INSERT INTO messages_fts_cjk(rowid, content) VALUES (?, ?)", id, m.Content,
+	); err != nil {
+		return 0, fmt.Errorf("updating messages_fts_cjk: %w", err)
+	}
+
 	return id, tx.Commit()
 }
 

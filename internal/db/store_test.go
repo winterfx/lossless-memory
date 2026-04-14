@@ -383,10 +383,12 @@ func TestFTSSearch(t *testing.T) {
 		Model: "test", CreatedAt: now,
 	})
 
-	// SearchMessages
-	results, err := store.SearchMessages("authentication", wid, 10)
+	p := SearchParams{Query: "authentication", WorkspaceID: wid, Sort: "relevance", Limit: 10}
+
+	// SearchMessagesFTS
+	results, err := store.SearchMessagesFTS(p)
 	if err != nil {
-		t.Fatalf("SearchMessages: %v", err)
+		t.Fatalf("SearchMessagesFTS: %v", err)
 	}
 	if len(results) != 1 {
 		t.Fatalf("expected 1 message result, got %d", len(results))
@@ -394,43 +396,46 @@ func TestFTSSearch(t *testing.T) {
 	if results[0].Type != "message" {
 		t.Fatalf("expected type=message, got %s", results[0].Type)
 	}
-
-	// SearchSummaries
-	results, err = store.SearchSummaries("authentication", wid, 10)
-	if err != nil {
-		t.Fatalf("SearchSummaries: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 summary result, got %d", len(results))
-	}
-	if results[0].Type != "summary" {
-		t.Fatalf("expected type=summary, got %s", results[0].Type)
+	if results[0].Snippet == "" {
+		t.Fatal("expected non-empty snippet")
 	}
 
-	// SearchAll
-	results, err = store.SearchAll("authentication", wid, 10)
+	// SearchSummariesFTS
+	sumResults, err := store.SearchSummariesFTS(p)
 	if err != nil {
-		t.Fatalf("SearchAll: %v", err)
+		t.Fatalf("SearchSummariesFTS: %v", err)
 	}
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
+	if len(sumResults) != 1 {
+		t.Fatalf("expected 1 summary result, got %d", len(sumResults))
+	}
+	if sumResults[0].Type != "summary" {
+		t.Fatalf("expected type=summary, got %s", sumResults[0].Type)
+	}
+
+	// Combined search (both scopes)
+	combined := append(results, sumResults...)
+	combined = MergeResults(combined, "relevance", 10)
+	if len(combined) != 2 {
+		t.Fatalf("expected 2 combined results, got %d", len(combined))
 	}
 
 	// No results
-	results, err = store.SearchMessages("kubernetes", wid, 10)
+	pNone := SearchParams{Query: "kubernetes", WorkspaceID: wid, Sort: "relevance", Limit: 10}
+	results, err = store.SearchMessagesFTS(pNone)
 	if err != nil {
-		t.Fatalf("SearchMessages no match: %v", err)
+		t.Fatalf("SearchMessagesFTS no match: %v", err)
 	}
 	if len(results) != 0 {
 		t.Fatalf("expected 0 results, got %d", len(results))
 	}
 
-	// SearchAllWorkspaces
-	results, err = store.SearchAllWorkspaces("database", 10)
+	// All workspaces
+	pAll := SearchParams{Query: "database", WorkspaceID: 0, Sort: "relevance", Limit: 10}
+	allResults, err := store.SearchMessagesFTS(pAll)
 	if err != nil {
-		t.Fatalf("SearchAllWorkspaces: %v", err)
+		t.Fatalf("SearchMessagesFTS all workspaces: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
+	if len(allResults) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(allResults))
 	}
 }

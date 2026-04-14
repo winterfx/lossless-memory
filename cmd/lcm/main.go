@@ -63,7 +63,7 @@ Commands:
   digest    Create summaries for a session (reads hook input from stdin)
   overview  Generate session overview (reads hook input from stdin)
   recall    Search/describe/expand memory
-    search  --cwd <path> --query <text> [--all] [--limit N]
+    search  --cwd <path> --query <text> [--mode full_text|regex] [--scope messages|summaries|both] [--sort relevance|recency|hybrid] [--since <datetime>] [--before <datetime>] [--all] [--limit N]
     describe --id <sum_xxx>
     expand  --id <sum_xxx> [--max-depth N] [--include-messages]
   status    Show database statistics --cwd <path>`)
@@ -170,25 +170,37 @@ func runOverview() {
 
 func runRecallSearch() {
 	args := parseArgs(os.Args[3:])
-	cwd := args["cwd"]
-	query := args["query"]
-	all := args["all"] == "true"
-	limit := 20
+
+	opts := recall.SearchOptions{
+		Query:  args["query"],
+		Mode:   args["mode"],
+		Scope:  args["scope"],
+		Sort:   args["sort"],
+		Since:  args["since"],
+		Before: args["before"],
+		Cwd:    args["cwd"],
+		All:    args["all"] == "true",
+	}
 	if l, ok := args["limit"]; ok {
 		if n, err := strconv.Atoi(l); err == nil {
-			limit = n
+			opts.Limit = n
 		}
 	}
 
-	if query == "" {
-		fmt.Fprintln(os.Stderr, "usage: lcm recall search --cwd <path> --query <text> [--all] [--limit N]")
+	if opts.Query == "" {
+		fmt.Fprintln(os.Stderr, `usage: lcm recall search --cwd <path> --query <text>
+    [--mode full_text|regex]
+    [--scope messages|summaries|both]
+    [--sort relevance|recency|hybrid]
+    [--since <datetime>] [--before <datetime>]
+    [--all] [--limit N]`)
 		os.Exit(1)
 	}
 
 	store := openStore()
 	defer store.Close()
 
-	result, err := recall.Search(store, query, cwd, all, limit)
+	result, err := recall.Search(store, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "search error: %v\n", err)
 		os.Exit(1)

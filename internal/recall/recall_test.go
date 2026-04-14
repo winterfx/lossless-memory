@@ -11,9 +11,10 @@ import (
 
 // setupTestStore creates an in-memory store with test data:
 // - 1 workspace at /tmp/project
-// - 3 messages in sess-1
-// - 1 leaf summary (sum_leaf_001) linked to all 3 messages
-// - 1 leaf summary (sum_leaf_002)
+// - 3 messages in sess-1 (English)
+// - 1 Chinese message in sess-2
+// - 1 leaf summary (sum_leaf_001) linked to all 3 English messages
+// - 1 leaf summary (sum_leaf_002) with Chinese content
 // - 1 condensed summary (sum_cond_001) at depth 1, parent of both leaves
 func setupTestStore(t *testing.T) (*db.Store, int64) {
 	t.Helper()
@@ -26,7 +27,7 @@ func setupTestStore(t *testing.T) (*db.Store, int64) {
 	wid, _ := store.EnsureWorkspace("/tmp/project")
 	now := time.Now()
 
-	// Messages
+	// English messages
 	var msgIDs []int64
 	contents := []string{
 		"fix the authentication bug in login flow",
@@ -45,7 +46,14 @@ func setupTestStore(t *testing.T) (*db.Store, int64) {
 		msgIDs = append(msgIDs, id)
 	}
 
-	// Leaf 1
+	// Chinese message
+	store.InsertMessage(&db.Message{
+		WorkspaceID: wid, SessionID: "sess-2", Seq: 0,
+		Role: "user", Content: "修复了登录认证的端到端测试结果", TokenCount: 12,
+		CreatedAt: now.Add(5 * time.Minute),
+	})
+
+	// Leaf 1 (English)
 	store.InsertSummary(&db.Summary{
 		ID: "sum_leaf_001", WorkspaceID: wid, Kind: "leaf", Depth: 0,
 		Content:    "worked on authentication bug fix and database migration",
@@ -54,10 +62,10 @@ func setupTestStore(t *testing.T) (*db.Store, int64) {
 	})
 	store.LinkSummaryMessages("sum_leaf_001", msgIDs)
 
-	// Leaf 2
+	// Leaf 2 (Chinese)
 	store.InsertSummary(&db.Summary{
 		ID: "sum_leaf_002", WorkspaceID: wid, Kind: "leaf", Depth: 0,
-		Content:    "added comprehensive testing for user service layer",
+		Content:    "添加了用户服务层的综合测试覆盖",
 		TokenCount: 8, EarliestAt: now.Add(3 * time.Minute), LatestAt: now.Add(5 * time.Minute),
 		Model: "test", CreatedAt: now.Add(time.Minute),
 	})
@@ -77,7 +85,9 @@ func setupTestStore(t *testing.T) (*db.Store, int64) {
 func TestSearch(t *testing.T) {
 	store, _ := setupTestStore(t)
 
-	result, err := Search(store, "authentication", "/tmp/project", false, 10)
+	result, err := Search(store, SearchOptions{
+		Query: "authentication", Cwd: "/tmp/project", Limit: 10,
+	})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -100,6 +110,14 @@ func TestSearch(t *testing.T) {
 		if item.Type == "summary" {
 			hasSummary = true
 		}
+		// Verify snippet is not empty
+		if item.Snippet == "" {
+			t.Error("expected non-empty snippet")
+		}
+		// Verify created_at is populated
+		if item.CreatedAt == "" {
+			t.Error("expected non-empty created_at")
+		}
 	}
 	if !hasMessage {
 		t.Error("expected a message result")
@@ -109,7 +127,7 @@ func TestSearch(t *testing.T) {
 	}
 }
 
-func TestSearchSnippetTruncation(t *testing.T) {
+func TestSearchWithSnippet(t *testing.T) {
 	store, err := db.OpenInMemory()
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +145,9 @@ func TestSearchSnippetTruncation(t *testing.T) {
 		CreatedAt: now,
 	})
 
-	result, err := Search(store, "authentication", "/tmp/project", false, 10)
+	result, err := Search(store, SearchOptions{
+		Query: "authentication", Cwd: "/tmp/project", Limit: 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +157,8 @@ func TestSearchSnippetTruncation(t *testing.T) {
 	if len(items) == 0 {
 		t.Fatal("expected results")
 	}
-	if len(items[0].Snippet) > 310 {
+	if len(items[0].Snippet) > 210 {
 		t.Fatalf("snippet too long: %d chars", len(items[0].Snippet))
-	}
-	if !strings.HasSuffix(items[0].Snippet, "...") {
-		t.Fatal("expected snippet to end with ...")
 	}
 }
 
@@ -152,7 +169,9 @@ func TestSearchNoWorkspace(t *testing.T) {
 	}
 	defer store.Close()
 
-	result, err := Search(store, "anything", "/nonexistent", false, 10)
+	result, err := Search(store, SearchOptions{
+		Query: "anything", Cwd: "/nonexistent", Limit: 10,
+	})
 	if err != nil {
 		t.Fatalf("Search nonexistent workspace: %v", err)
 	}
@@ -164,7 +183,9 @@ func TestSearchNoWorkspace(t *testing.T) {
 func TestSearchAll(t *testing.T) {
 	store, _ := setupTestStore(t)
 
-	result, err := Search(store, "authentication", "/tmp/project", true, 10)
+	result, err := Search(store, SearchOptions{
+		Query: "authentication", All: true, Limit: 10,
+	})
 	if err != nil {
 		t.Fatalf("Search --all: %v", err)
 	}
@@ -175,6 +196,157 @@ func TestSearchAll(t *testing.T) {
 		t.Fatal("expected results with --all")
 	}
 }
+
+func TestSearchSortModes(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	for _, sort := range []string{"relevance", "recency", "hybrid"} {
+		result, err := Search(store, SearchOptions{
+			Query: "authentication", Cwd: "/tmp/project",
+			Sort: sort, Limit: 10,
+		})
+		if err != nil {
+			t.Fatalf("Search sort=%s: %v", sort, err)
+		}
+
+		var items []SearchResult
+		json.Unmarshal([]byte(result), &items)
+		if len(items) == 0 {
+			t.Fatalf("expected results with sort=%s", sort)
+		}
+	}
+}
+
+func TestSearchScope(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Messages only
+	result, err := Search(store, SearchOptions{
+		Query: "authentication", Cwd: "/tmp/project",
+		Scope: "messages", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	for _, item := range items {
+		if item.Type != "message" {
+			t.Fatalf("scope=messages returned type=%s", item.Type)
+		}
+	}
+
+	// Summaries only
+	result, err = Search(store, SearchOptions{
+		Query: "authentication", Cwd: "/tmp/project",
+		Scope: "summaries", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal([]byte(result), &items)
+	for _, item := range items {
+		if item.Type != "summary" {
+			t.Fatalf("scope=summaries returned type=%s", item.Type)
+		}
+	}
+}
+
+func TestSearchTimeFilter(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Search with a future since — should return no results
+	result, err := Search(store, SearchOptions{
+		Query: "authentication", Cwd: "/tmp/project",
+		Since: "2099-01-01", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 results with future since, got %d", len(items))
+	}
+}
+
+func TestSearchRegex(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	result, err := Search(store, SearchOptions{
+		Query: "auth.*bug", Cwd: "/tmp/project",
+		Mode: "regex", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	if len(items) == 0 {
+		t.Fatal("expected regex results")
+	}
+	if items[0].Type != "message" {
+		t.Fatalf("expected message, got %s", items[0].Type)
+	}
+}
+
+func TestSearchCJK(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Search for Chinese content (>= 3 CJK chars → trigram path)
+	result, err := Search(store, SearchOptions{
+		Query: "端到端测试", Cwd: "/tmp/project", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	if len(items) == 0 {
+		t.Fatal("expected CJK search results")
+	}
+}
+
+func TestSearchCJKShort(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Search with short CJK query (< 3 chars → LIKE fallback)
+	result, err := Search(store, SearchOptions{
+		Query: "测试", Cwd: "/tmp/project", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	if len(items) == 0 {
+		t.Fatal("expected CJK LIKE fallback results")
+	}
+}
+
+func TestSearchMixed(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	// Mixed query — search for Chinese term "认证" present in Chinese message
+	result, err := Search(store, SearchOptions{
+		Query: "认证", Cwd: "/tmp/project", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var items []SearchResult
+	json.Unmarshal([]byte(result), &items)
+	// Should find the Chinese message containing "认证"
+	if len(items) == 0 {
+		t.Fatal("expected mixed search results")
+	}
+}
+
+// --- Describe tests ---
 
 func TestDescribeLeaf(t *testing.T) {
 	store, _ := setupTestStore(t)
@@ -201,7 +373,6 @@ func TestDescribeLeaf(t *testing.T) {
 	if len(desc.ParentIDs) != 0 {
 		t.Fatalf("expected 0 parent_ids for leaf, got %d", len(desc.ParentIDs))
 	}
-	// sum_leaf_001 is a parent of sum_cond_001
 	if len(desc.ChildIDs) != 1 || desc.ChildIDs[0] != "sum_cond_001" {
 		t.Fatalf("expected child_ids=[sum_cond_001], got %v", desc.ChildIDs)
 	}
@@ -245,6 +416,8 @@ func TestDescribeNotFound(t *testing.T) {
 	}
 }
 
+// --- Expand tests ---
+
 func TestExpandCondensed(t *testing.T) {
 	store, _ := setupTestStore(t)
 
@@ -267,7 +440,6 @@ func TestExpandCondensed(t *testing.T) {
 	if len(exp.Children) != 2 {
 		t.Fatalf("expected 2 children, got %d", len(exp.Children))
 	}
-	// Children should be the two leaves
 	for _, child := range exp.Children {
 		if child.Depth != 0 {
 			t.Fatalf("expected child depth=0, got %d", child.Depth)
@@ -286,7 +458,6 @@ func TestExpandWithMessages(t *testing.T) {
 	var exp ExpandResult
 	json.Unmarshal([]byte(result), &exp)
 
-	// The first child (sum_leaf_001) should have messages
 	found := false
 	for _, child := range exp.Children {
 		if child.SummaryID == "sum_leaf_001" && len(child.Messages) == 3 {
@@ -302,7 +473,6 @@ func TestExpandWithMessages(t *testing.T) {
 func TestExpandMaxDepth(t *testing.T) {
 	store, _ := setupTestStore(t)
 
-	// maxDepth=0 should only return the top-level summary, no children
 	result, err := Expand(store, "sum_cond_001", 0, false)
 	if err != nil {
 		t.Fatalf("Expand maxDepth=0: %v", err)

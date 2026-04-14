@@ -59,6 +59,13 @@ func (s *Store) InsertSummary(sum *Summary) error {
 		return fmt.Errorf("updating summaries_fts: %w", err)
 	}
 
+	// Update CJK trigram FTS index
+	if _, err := tx.Exec(
+		"INSERT INTO summaries_fts_cjk(rowid, content) VALUES (?, ?)", rowid, sum.Content,
+	); err != nil {
+		return fmt.Errorf("updating summaries_fts_cjk: %w", err)
+	}
+
 	return tx.Commit()
 }
 
