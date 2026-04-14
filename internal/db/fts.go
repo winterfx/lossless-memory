@@ -3,14 +3,11 @@ package db
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
-
-// ---------------------------------------------------------------------------
-// Structs
-// ---------------------------------------------------------------------------
 
 // SearchParams defines parameters for FTS, CJK, regex, and LIKE searches.
 type SearchParams struct {
@@ -32,13 +29,120 @@ type FTSSearchResult struct {
 	Role      string // message role (user/assistant), empty for summaries
 }
 
-// ---------------------------------------------------------------------------
-// FTS5 query sanitization
-// ---------------------------------------------------------------------------
+// scanFunc is the signature of sql.Rows.Scan, used by searchTarget scan helpers.
+type scanFunc = func(dest ...interface{}) error
+
+// searchTarget captures the schema differences between the messages and summaries
+// tables so that search methods can be written once and applied to both.
+//
+// hasRole distinguishes the two targets:
+//   - messages (hasRole=true):  integer ID, has role column
+//   - summaries (hasRole=false): text ID, no role column
+type searchTarget struct {
+	table      string // "messages" | "summaries"
+	alias      string // "m" | "s"
+	ftsTable   string // "messages_fts" | "summaries_fts"
+	cjkTable   string // "messages_fts_cjk" | "summaries_fts_cjk"
+	joinOn     string // FTS join condition
+	resultType string // "message" | "summary"
+	hasRole    bool
+}
+
+var msgTarget = searchTarget{
+	table: "messages", alias: "m",
+	ftsTable: "messages_fts", cjkTable: "messages_fts_cjk",
+	joinOn: "m.id = f.rowid", resultType: "message", hasRole: true,
+}
+
+var sumTarget = searchTarget{
+	table: "summaries", alias: "s",
+	ftsTable: "summaries_fts", cjkTable: "summaries_fts_cjk",
+	joinOn: "s.rowid = f.rowid", resultType: "summary", hasRole: false,
+}
+
+// selectFTS returns the SELECT column list for FTS queries (snippet + rank).
+//   messages:  m.id, snippet(...), m.created_at, m.role, rank
+//   summaries: s.id, snippet(...), s.created_at, rank
+func (t searchTarget) selectFTS(ftsTable string) string {
+	a := t.alias
+	if t.hasRole {
+		return fmt.Sprintf("%s.id, snippet(%s, 0, '', '', '...', 32), %s.created_at, %s.role, rank", a, ftsTable, a, a)
+	}
+	return fmt.Sprintf("%s.id, snippet(%s, 0, '', '', '...', 32), %s.created_at, rank", a, ftsTable, a)
+}
+
+// selectContent returns the SELECT column list for LIKE/regex queries (raw content).
+//   messages:  m.id, m.content, m.created_at, m.role
+//   summaries: s.id, s.content, s.created_at
+func (t searchTarget) selectContent() string {
+	a := t.alias
+	if t.hasRole {
+		return fmt.Sprintf("%s.id, %s.content, %s.created_at, %s.role", a, a, a, a)
+	}
+	return fmt.Sprintf("%s.id, %s.content, %s.created_at", a, a, a)
+}
+
+// scanFTSRow scans one FTS result row (snippet + rank) via the given rows.Scan function.
+func (t searchTarget) scanFTSRow(scan scanFunc) (FTSSearchResult, error) {
+	var r FTSSearchResult
+	r.Type = t.resultType
+	if t.hasRole {
+		var id int64
+		if err := scan(&id, &r.Snippet, &r.CreatedAt, &r.Role, &r.Rank); err != nil {
+			return r, err
+		}
+		r.ID = fmt.Sprintf("%d", id)
+	} else {
+		if err := scan(&r.ID, &r.Snippet, &r.CreatedAt, &r.Rank); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
+}
+
+// scanContentRow scans one content row (raw text) via the given rows.Scan function.
+// Returns the result and the raw content (for snippet generation by the caller).
+func (t searchTarget) scanContentRow(scan scanFunc) (FTSSearchResult, string, error) {
+	var r FTSSearchResult
+	var content string
+	r.Type = t.resultType
+	if t.hasRole {
+		var id int64
+		if err := scan(&id, &content, &r.CreatedAt, &r.Role); err != nil {
+			return r, "", err
+		}
+		r.ID = fmt.Sprintf("%d", id)
+	} else {
+		if err := scan(&r.ID, &content, &r.CreatedAt); err != nil {
+			return r, "", err
+		}
+	}
+	return r, content, nil
+}
+
+// collectFTSRows scans all rows from an FTS query into a result slice.
+func (t searchTarget) collectFTSRows(rows interface {
+	Next() bool
+	Scan(...interface{}) error
+	Err() error
+}) ([]FTSSearchResult, error) {
+	var results []FTSSearchResult
+	for rows.Next() {
+		r, err := t.scanFTSRow(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// --- FTS5 query sanitization ---
 
 var phraseRegex = regexp.MustCompile(`"([^"]+)"`)
 
 // SanitizeFTS5Query escapes user input for safe use in an FTS5 MATCH expression.
+// Each unquoted token is wrapped in double-quotes; user-quoted phrases are preserved.
 func SanitizeFTS5Query(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return ""
@@ -75,45 +179,52 @@ func SanitizeFTS5Query(raw string) string {
 	return strings.Join(parts, " ")
 }
 
-// ---------------------------------------------------------------------------
-// CJK detection
-// ---------------------------------------------------------------------------
+// --- CJK detection and helpers ---
 
-// ContainsCJK returns true if the string contains CJK, Hiragana, Katakana, or Hangul characters.
+func isCJKRune(r rune) bool {
+	return (r >= 0x2E80 && r <= 0x9FFF) || // CJK Unified Ideographs + Radicals
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK Extension A
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility Ideographs
+		(r >= 0x3040 && r <= 0x309F) || // Hiragana
+		(r >= 0x30A0 && r <= 0x30FF) || // Katakana
+		(r >= 0xAC00 && r <= 0xD7AF) // Hangul
+}
+
+// ContainsCJK returns true if s contains any CJK/Hiragana/Katakana/Hangul character.
 func ContainsCJK(s string) bool {
 	for _, r := range s {
-		if (r >= 0x2E80 && r <= 0x9FFF) || // CJK Unified Ideographs + Radicals
-			(r >= 0x3400 && r <= 0x4DBF) || // CJK Extension A
-			(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility Ideographs
-			(r >= 0x3040 && r <= 0x309F) || // Hiragana
-			(r >= 0x30A0 && r <= 0x30FF) || // Katakana
-			(r >= 0xAC00 && r <= 0xD7AF) { // Hangul
+		if isCJKRune(r) {
 			return true
 		}
 	}
 	return false
 }
 
-// cjkSegmentRegex matches contiguous CJK character runs.
 var cjkSegmentRegex = regexp.MustCompile(`[\x{2E80}-\x{9FFF}\x{3400}-\x{4DBF}\x{F900}-\x{FAFF}\x{AC00}-\x{D7AF}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+`)
-
-// latinTokenRegex matches Latin/ASCII word tokens.
 var latinTokenRegex = regexp.MustCompile(`[a-zA-Z0-9][\w./-]*`)
 
-// cjkRuneCount counts CJK runes in a string.
 func cjkRuneCount(s string) int {
 	n := 0
 	for _, r := range s {
-		if (r >= 0x2E80 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF) ||
-			(r >= 0xF900 && r <= 0xFAFF) || (r >= 0x3040 && r <= 0x309F) ||
-			(r >= 0x30A0 && r <= 0x30FF) || (r >= 0xAC00 && r <= 0xD7AF) {
+		if isCJKRune(r) {
 			n++
 		}
 	}
 	return n
 }
 
-// splitCJKChunks splits a CJK string into overlapping chunks of the given rune size.
+// hasCJKShortSegment reports whether query has any CJK segment shorter than 3 runes
+// (too short for trigram FTS, needs LIKE fallback).
+func hasCJKShortSegment(query string) bool {
+	for _, seg := range cjkSegmentRegex.FindAllString(query, -1) {
+		if cjkRuneCount(seg) < 3 {
+			return true
+		}
+	}
+	return false
+}
+
+// splitCJKChunks splits a CJK string into de-duplicated overlapping chunks of the given rune size.
 func splitCJKChunks(s string, size int) []string {
 	runes := []rune(s)
 	if len(runes) <= size {
@@ -131,9 +242,10 @@ func splitCJKChunks(s string, size int) []string {
 	return chunks
 }
 
-// buildCJKMatchExpr builds an FTS5 MATCH expression for CJK queries using trigram chunking.
-// Returns the MATCH expr, any extra LIKE clauses for Latin tokens, and the LIKE args.
-func buildCJKMatchExpr(query string) (matchExpr string, likeClauses []string, likeArgs []interface{}) {
+// buildCJKMatchExpr builds an FTS5 MATCH expression for CJK trigram queries.
+// Latin tokens in the query are returned as separate LIKE clauses (already qualified
+// with the given table alias, e.g. "m" or "s").
+func buildCJKMatchExpr(query, alias string) (matchExpr string, likeClauses []string, likeArgs []interface{}) {
 	cjkSegments := cjkSegmentRegex.FindAllString(query, -1)
 	latinTokens := latinTokenRegex.FindAllString(query, -1)
 
@@ -157,16 +269,14 @@ func buildCJKMatchExpr(query string) (matchExpr string, likeClauses []string, li
 		matchExpr = strings.Join(cjkGroups, " AND ")
 	}
 
-	// Latin tokens need separate LIKE filtering
 	for _, tok := range latinTokens {
-		likeClauses = append(likeClauses, "LOWER(content) LIKE ? ESCAPE '\\'")
+		likeClauses = append(likeClauses, fmt.Sprintf("LOWER(%s.content) LIKE ? ESCAPE '\\'", alias))
 		likeArgs = append(likeArgs, "%"+escapeLikeTerm(strings.ToLower(tok))+"%")
 	}
 
 	return
 }
 
-// escapeLikeTerm escapes special LIKE characters.
 func escapeLikeTerm(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `%`, `\%`)
@@ -174,13 +284,10 @@ func escapeLikeTerm(s string) string {
 	return s
 }
 
-// ---------------------------------------------------------------------------
-// Sort helpers
-// ---------------------------------------------------------------------------
+// --- SQL builder helpers ---
 
-// buildOrderBy returns the ORDER BY clause for the given sort mode.
-func buildOrderBy(sort, alias string) string {
-	switch sort {
+func buildOrderBy(sortMode, alias string) string {
+	switch sortMode {
 	case "recency":
 		return fmt.Sprintf("%s.created_at DESC", alias)
 	case "hybrid":
@@ -190,18 +297,7 @@ func buildOrderBy(sort, alias string) string {
 	}
 }
 
-// buildOrderByNoRank returns ORDER BY for LIKE/regex queries (no rank column).
-func buildOrderByNoRank(sort, alias string) string {
-	// Without rank, all modes fall back to created_at DESC
-	return fmt.Sprintf("%s.created_at DESC", alias)
-}
-
-// ---------------------------------------------------------------------------
-// Time filter helpers
-// ---------------------------------------------------------------------------
-
-// appendTimeFilters appends WHERE clauses and args for since/before.
-func appendTimeFilters(where *[]string, args *[]interface{}, alias string, since, before string) {
+func appendTimeFilters(where *[]string, args *[]interface{}, alias, since, before string) {
 	if since != "" {
 		*where = append(*where, fmt.Sprintf("%s.created_at >= ?", alias))
 		*args = append(*args, since)
@@ -212,11 +308,40 @@ func appendTimeFilters(where *[]string, args *[]interface{}, alias string, since
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Fallback snippet extraction
-// ---------------------------------------------------------------------------
+// --- Snippet helpers (rune-safe) ---
 
-// CreateFallbackSnippet generates a snippet by centering on the earliest matching term.
+// safeSnippet extracts a snippet around byte offsets [matchStart, matchEnd),
+// converting to rune indices first to avoid splitting multi-byte characters.
+// ctxBefore/ctxAfter are the number of runes to include before/after the match.
+func safeSnippet(content string, matchStart, matchEnd, ctxBefore, ctxAfter int) string {
+	runes := []rune(content)
+	runeStart := utf8.RuneCountInString(content[:matchStart])
+	runeEnd := utf8.RuneCountInString(content[:matchEnd])
+
+	start := max(runeStart-ctxBefore, 0)
+	end := min(runeEnd+ctxAfter, len(runes))
+
+	prefix, suffix := "", ""
+	if start > 0 {
+		prefix = "..."
+	}
+	if end < len(runes) {
+		suffix = "..."
+	}
+	return prefix + strings.TrimSpace(string(runes[start:end])) + suffix
+}
+
+// truncateRunes returns s truncated to maxRunes runes with "..." appended if needed.
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return strings.TrimRight(string(runes[:maxRunes-3]), " ") + "..."
+}
+
+// CreateFallbackSnippet generates a snippet centered on the first matching term.
+// Used when FTS5 snippet() is unavailable (LIKE / regex paths).
 func CreateFallbackSnippet(content string, terms []string) string {
 	haystack := strings.ToLower(content)
 	matchIndex := -1
@@ -231,36 +356,12 @@ func CreateFallbackSnippet(content string, terms []string) string {
 	}
 
 	if matchIndex == -1 {
-		head := strings.TrimSpace(content)
-		if len(head) <= 80 {
-			return head
-		}
-		return strings.TrimRight(head[:77], " ") + "..."
+		return truncateRunes(strings.TrimSpace(content), 80)
 	}
-
-	start := matchIndex - 24
-	if start < 0 {
-		start = 0
-	}
-	end := matchIndex + matchLength + 40
-	if end > len(content) {
-		end = len(content)
-	}
-
-	prefix := ""
-	if start > 0 {
-		prefix = "..."
-	}
-	suffix := ""
-	if end < len(content) {
-		suffix = "..."
-	}
-	return prefix + strings.TrimSpace(content[start:end]) + suffix
+	return safeSnippet(content, matchIndex, matchIndex+matchLength, 16, 30)
 }
 
-// ---------------------------------------------------------------------------
-// LIKE helpers
-// ---------------------------------------------------------------------------
+// --- LIKE helpers ---
 
 func isLikeMode(query string) bool {
 	trimmed := strings.TrimSpace(query)
@@ -278,97 +379,46 @@ func likePattern(query string) string {
 	return "%" + trimmed + "%"
 }
 
-// ---------------------------------------------------------------------------
-// SearchMessagesFTS — standard FTS5 search with snippet() and sort
-// ---------------------------------------------------------------------------
+// === Public API =============================================================
+//
+// Each public method delegates to a unified internal method with the
+// appropriate searchTarget (msgTarget or sumTarget).
 
 func (s *Store) SearchMessagesFTS(p SearchParams) ([]FTSSearchResult, error) {
-	if isLikeMode(p.Query) {
-		return s.searchMessagesLike(p)
-	}
-
-	// CJK routing
-	if ContainsCJK(p.Query) {
-		segs := cjkSegmentRegex.FindAllString(p.Query, -1)
-		hasShort := false
-		for _, seg := range segs {
-			if cjkRuneCount(seg) < 3 {
-				hasShort = true
-				break
-			}
-		}
-		if !hasShort {
-			results, err := s.searchMessagesCJKTrigram(p)
-			if err == nil && len(results) > 0 {
-				return results, nil
-			}
-			// Fall through to LIKE on error or no results
-		}
-		return s.searchMessagesCJKLike(p)
-	}
-
-	sanitized := SanitizeFTS5Query(p.Query)
-	if sanitized == "" {
-		return nil, nil
-	}
-
-	var where []string
-	var args []interface{}
-	where = append(where, "messages_fts MATCH ?")
-	args = append(args, sanitized)
-	if p.WorkspaceID > 0 {
-		where = append(where, "m.workspace_id = ?")
-		args = append(args, p.WorkspaceID)
-	}
-	appendTimeFilters(&where, &args, "m", p.Since, p.Before)
-	args = append(args, p.Limit)
-
-	query := fmt.Sprintf(
-		`SELECT m.id, snippet(messages_fts, 0, '', '', '...', 32), m.created_at, m.role, rank
-		 FROM messages_fts f
-		 JOIN messages m ON m.id = f.rowid
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderBy(p.Sort, "m"),
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("searching messages FTS: %w", err)
-	}
-	defer rows.Close()
-
-	return scanMessagesFTS(rows)
+	return s.searchFTS(msgTarget, p)
 }
-
-// ---------------------------------------------------------------------------
-// SearchSummariesFTS — standard FTS5 search with snippet() and sort
-// ---------------------------------------------------------------------------
 
 func (s *Store) SearchSummariesFTS(p SearchParams) ([]FTSSearchResult, error) {
+	return s.searchFTS(sumTarget, p)
+}
+
+func (s *Store) SearchMessagesRegex(p SearchParams) ([]FTSSearchResult, error) {
+	return s.searchRegex(msgTarget, p)
+}
+
+func (s *Store) SearchSummariesRegex(p SearchParams) ([]FTSSearchResult, error) {
+	return s.searchRegex(sumTarget, p)
+}
+
+// === Internal search methods ================================================
+
+// searchFTS routes the query to the appropriate search strategy:
+//   - LIKE mode (wildcards)   → searchLike
+//   - CJK text (>= 3 runes)  → searchCJKTrigram, fallback to searchCJKLike
+//   - CJK text (< 3 runes)   → searchCJKLike
+//   - Latin text              → standard FTS5 MATCH
+func (s *Store) searchFTS(t searchTarget, p SearchParams) ([]FTSSearchResult, error) {
 	if isLikeMode(p.Query) {
-		return s.searchSummariesLike(p)
+		return s.searchLike(t, p)
 	}
 
-	// CJK routing
 	if ContainsCJK(p.Query) {
-		segs := cjkSegmentRegex.FindAllString(p.Query, -1)
-		hasShort := false
-		for _, seg := range segs {
-			if cjkRuneCount(seg) < 3 {
-				hasShort = true
-				break
-			}
-		}
-		if !hasShort {
-			results, err := s.searchSummariesCJKTrigram(p)
-			if err == nil && len(results) > 0 {
+		if !hasCJKShortSegment(p.Query) {
+			if results, err := s.searchCJKTrigram(t, p); err == nil && len(results) > 0 {
 				return results, nil
 			}
 		}
-		return s.searchSummariesCJKLike(p)
+		return s.searchCJKLike(t, p)
 	}
 
 	sanitized := SanitizeFTS5Query(p.Query)
@@ -378,135 +428,73 @@ func (s *Store) SearchSummariesFTS(p SearchParams) ([]FTSSearchResult, error) {
 
 	var where []string
 	var args []interface{}
-	where = append(where, "summaries_fts MATCH ?")
+	where = append(where, fmt.Sprintf("%s MATCH ?", t.ftsTable))
 	args = append(args, sanitized)
 	if p.WorkspaceID > 0 {
-		where = append(where, "s.workspace_id = ?")
+		where = append(where, fmt.Sprintf("%s.workspace_id = ?", t.alias))
 		args = append(args, p.WorkspaceID)
 	}
-	appendTimeFilters(&where, &args, "s", p.Since, p.Before)
+	appendTimeFilters(&where, &args, t.alias, p.Since, p.Before)
 	args = append(args, p.Limit)
 
-	query := fmt.Sprintf(
-		`SELECT s.id, snippet(summaries_fts, 0, '', '', '...', 32), s.created_at, rank
-		 FROM summaries_fts f
-		 JOIN summaries s ON s.rowid = f.rowid
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderBy(p.Sort, "s"),
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s f JOIN %s %s ON %s WHERE %s ORDER BY %s LIMIT ?`,
+		t.selectFTS(t.ftsTable), t.ftsTable, t.table, t.alias, t.joinOn,
+		strings.Join(where, " AND "), buildOrderBy(p.Sort, t.alias),
 	)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("searching summaries FTS: %w", err)
+		return nil, fmt.Errorf("searching %s FTS: %w", t.table, err)
 	}
 	defer rows.Close()
-
-	return scanSummariesFTS(rows)
+	return t.collectFTSRows(rows)
 }
 
-// ---------------------------------------------------------------------------
-// CJK trigram FTS search
-// ---------------------------------------------------------------------------
-
-func (s *Store) searchMessagesCJKTrigram(p SearchParams) ([]FTSSearchResult, error) {
-	matchExpr, likeClauses, likeArgs := buildCJKMatchExpr(p.Query)
+// searchCJKTrigram searches using the CJK trigram FTS5 table.
+func (s *Store) searchCJKTrigram(t searchTarget, p SearchParams) ([]FTSSearchResult, error) {
+	matchExpr, likeClauses, likeArgs := buildCJKMatchExpr(p.Query, t.alias)
 	if matchExpr == "" {
 		return nil, nil
 	}
 
 	var where []string
 	var args []interface{}
-	where = append(where, "messages_fts_cjk MATCH ?")
+	where = append(where, fmt.Sprintf("%s MATCH ?", t.cjkTable))
 	args = append(args, matchExpr)
 	if p.WorkspaceID > 0 {
-		where = append(where, "m.workspace_id = ?")
+		where = append(where, fmt.Sprintf("%s.workspace_id = ?", t.alias))
 		args = append(args, p.WorkspaceID)
 	}
-	for _, lc := range likeClauses {
-		// Rewrite to reference m.content
-		where = append(where, strings.Replace(lc, "content", "m.content", 1))
-	}
+	where = append(where, likeClauses...)
 	args = append(args, likeArgs...)
-	appendTimeFilters(&where, &args, "m", p.Since, p.Before)
+	appendTimeFilters(&where, &args, t.alias, p.Since, p.Before)
 	args = append(args, p.Limit)
 
-	query := fmt.Sprintf(
-		`SELECT m.id, snippet(messages_fts_cjk, 0, '', '', '...', 32), m.created_at, m.role, rank
-		 FROM messages_fts_cjk f
-		 JOIN messages m ON m.id = f.rowid
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderBy(p.Sort, "m"),
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s f JOIN %s %s ON %s WHERE %s ORDER BY %s LIMIT ?`,
+		t.selectFTS(t.cjkTable), t.cjkTable, t.table, t.alias, t.joinOn,
+		strings.Join(where, " AND "), buildOrderBy(p.Sort, t.alias),
 	)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	return scanMessagesFTS(rows)
+	return t.collectFTSRows(rows)
 }
 
-func (s *Store) searchSummariesCJKTrigram(p SearchParams) ([]FTSSearchResult, error) {
-	matchExpr, likeClauses, likeArgs := buildCJKMatchExpr(p.Query)
-	if matchExpr == "" {
-		return nil, nil
-	}
-
-	var where []string
-	var args []interface{}
-	where = append(where, "summaries_fts_cjk MATCH ?")
-	args = append(args, matchExpr)
-	if p.WorkspaceID > 0 {
-		where = append(where, "s.workspace_id = ?")
-		args = append(args, p.WorkspaceID)
-	}
-	for _, lc := range likeClauses {
-		where = append(where, strings.Replace(lc, "content", "s.content", 1))
-	}
-	args = append(args, likeArgs...)
-	appendTimeFilters(&where, &args, "s", p.Since, p.Before)
-	args = append(args, p.Limit)
-
-	query := fmt.Sprintf(
-		`SELECT s.id, snippet(summaries_fts_cjk, 0, '', '', '...', 32), s.created_at, rank
-		 FROM summaries_fts_cjk f
-		 JOIN summaries s ON s.rowid = f.rowid
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderBy(p.Sort, "s"),
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	return scanSummariesFTS(rows)
-}
-
-// ---------------------------------------------------------------------------
-// CJK LIKE fallback (for < 3 CJK chars or trigram table errors)
-// ---------------------------------------------------------------------------
-
-func (s *Store) searchMessagesCJKLike(p SearchParams) ([]FTSSearchResult, error) {
+// searchCJKLike is the LIKE fallback for CJK queries with short segments (< 3 runes)
+// or when the trigram table returns no results.
+func (s *Store) searchCJKLike(t searchTarget, p SearchParams) ([]FTSSearchResult, error) {
 	cjkSegs := cjkSegmentRegex.FindAllString(p.Query, -1)
 	latinTokens := latinTokenRegex.FindAllString(p.Query, -1)
 
 	var where []string
 	var args []interface{}
-
 	if p.WorkspaceID > 0 {
-		where = append(where, "m.workspace_id = ?")
+		where = append(where, fmt.Sprintf("%s.workspace_id = ?", t.alias))
 		args = append(args, p.WorkspaceID)
 	}
 
@@ -521,151 +509,64 @@ func (s *Store) searchMessagesCJKLike(p SearchParams) ([]FTSSearchResult, error)
 		}
 		snippetTerms = append(snippetTerms, terms...)
 		var clauses []string
-		for _, t := range terms {
-			clauses = append(clauses, "m.content LIKE ? ESCAPE '\\'")
-			args = append(args, "%"+escapeLikeTerm(t)+"%")
+		for _, term := range terms {
+			clauses = append(clauses, fmt.Sprintf("%s.content LIKE ? ESCAPE '\\'", t.alias))
+			args = append(args, "%"+escapeLikeTerm(term)+"%")
 		}
 		where = append(where, "("+strings.Join(clauses, " OR ")+")")
 	}
 
 	for _, tok := range latinTokens {
 		snippetTerms = append(snippetTerms, tok)
-		where = append(where, "LOWER(m.content) LIKE ? ESCAPE '\\'")
+		where = append(where, fmt.Sprintf("LOWER(%s.content) LIKE ? ESCAPE '\\'", t.alias))
 		args = append(args, "%"+escapeLikeTerm(strings.ToLower(tok))+"%")
 	}
 
-	appendTimeFilters(&where, &args, "m", p.Since, p.Before)
-
+	appendTimeFilters(&where, &args, t.alias, p.Since, p.Before)
 	if len(where) == 0 {
 		return nil, nil
 	}
-
 	args = append(args, p.Limit)
 
-	query := fmt.Sprintf(
-		`SELECT m.id, m.content, m.created_at, m.role
-		 FROM messages m
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderByNoRank(p.Sort, "m"),
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s %s WHERE %s ORDER BY %s.created_at DESC LIMIT ?`,
+		t.selectContent(), t.table, t.alias,
+		strings.Join(where, " AND "), t.alias,
 	)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("searching messages CJK LIKE: %w", err)
+		return nil, fmt.Errorf("searching %s CJK LIKE: %w", t.table, err)
 	}
 	defer rows.Close()
 
 	var results []FTSSearchResult
 	for rows.Next() {
-		var r FTSSearchResult
-		var id int64
-		var content string
-		if err := rows.Scan(&id, &content, &r.CreatedAt, &r.Role); err != nil {
+		r, content, err := t.scanContentRow(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		r.ID = fmt.Sprintf("%d", id)
-		r.Type = "message"
 		r.Snippet = CreateFallbackSnippet(content, snippetTerms)
 		results = append(results, r)
 	}
 	return results, rows.Err()
 }
 
-func (s *Store) searchSummariesCJKLike(p SearchParams) ([]FTSSearchResult, error) {
-	cjkSegs := cjkSegmentRegex.FindAllString(p.Query, -1)
-	latinTokens := latinTokenRegex.FindAllString(p.Query, -1)
-
-	var where []string
-	var args []interface{}
-
-	if p.WorkspaceID > 0 {
-		where = append(where, "s.workspace_id = ?")
-		args = append(args, p.WorkspaceID)
-	}
-
-	var snippetTerms []string
-	for _, seg := range cjkSegs {
-		runes := []rune(seg)
-		var terms []string
-		if len(runes) <= 2 {
-			terms = []string{seg}
-		} else {
-			terms = splitCJKChunks(seg, 2)
-		}
-		snippetTerms = append(snippetTerms, terms...)
-		var clauses []string
-		for _, t := range terms {
-			clauses = append(clauses, "s.content LIKE ? ESCAPE '\\'")
-			args = append(args, "%"+escapeLikeTerm(t)+"%")
-		}
-		where = append(where, "("+strings.Join(clauses, " OR ")+")")
-	}
-
-	for _, tok := range latinTokens {
-		snippetTerms = append(snippetTerms, tok)
-		where = append(where, "LOWER(s.content) LIKE ? ESCAPE '\\'")
-		args = append(args, "%"+escapeLikeTerm(strings.ToLower(tok))+"%")
-	}
-
-	appendTimeFilters(&where, &args, "s", p.Since, p.Before)
-
-	if len(where) == 0 {
-		return nil, nil
-	}
-
-	args = append(args, p.Limit)
-
-	query := fmt.Sprintf(
-		`SELECT s.id, s.content, s.created_at
-		 FROM summaries s
-		 WHERE %s
-		 ORDER BY %s
-		 LIMIT ?`,
-		strings.Join(where, " AND "),
-		buildOrderByNoRank(p.Sort, "s"),
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("searching summaries CJK LIKE: %w", err)
-	}
-	defer rows.Close()
-
-	var results []FTSSearchResult
-	for rows.Next() {
-		var r FTSSearchResult
-		var content string
-		if err := rows.Scan(&r.ID, &content, &r.CreatedAt); err != nil {
-			return nil, err
-		}
-		r.Type = "summary"
-		r.Snippet = CreateFallbackSnippet(content, snippetTerms)
-		results = append(results, r)
-	}
-	return results, rows.Err()
-}
-
-// ---------------------------------------------------------------------------
-// LIKE search (for wildcard queries like % or *)
-// ---------------------------------------------------------------------------
-
-func (s *Store) searchMessagesLike(p SearchParams) ([]FTSSearchResult, error) {
+// searchLike handles wildcard queries (containing % or *).
+func (s *Store) searchLike(t searchTarget, p SearchParams) ([]FTSSearchResult, error) {
 	pat := likePattern(p.Query)
+
 	var where []string
 	var args []interface{}
-
 	if p.WorkspaceID > 0 {
-		where = append(where, "m.workspace_id = ?")
+		where = append(where, fmt.Sprintf("%s.workspace_id = ?", t.alias))
 		args = append(args, p.WorkspaceID)
 	}
 	if pat != "" {
-		where = append(where, "m.content LIKE ?")
+		where = append(where, fmt.Sprintf("%s.content LIKE ?", t.alias))
 		args = append(args, pat)
 	}
-	appendTimeFilters(&where, &args, "m", p.Since, p.Before)
+	appendTimeFilters(&where, &args, t.alias, p.Since, p.Before)
 
 	whereClause := ""
 	if len(where) > 0 {
@@ -673,109 +574,38 @@ func (s *Store) searchMessagesLike(p SearchParams) ([]FTSSearchResult, error) {
 	}
 	args = append(args, p.Limit)
 
-	query := fmt.Sprintf(
-		`SELECT m.id, m.content, m.created_at, m.role
-		 FROM messages m %s
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`, whereClause,
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s %s %s ORDER BY %s.created_at DESC LIMIT ?`,
+		t.selectContent(), t.table, t.alias, whereClause, t.alias,
 	)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("searching messages LIKE: %w", err)
+		return nil, fmt.Errorf("searching %s LIKE: %w", t.table, err)
 	}
 	defer rows.Close()
 
 	terms := strings.Fields(strings.TrimSpace(p.Query))
 	var results []FTSSearchResult
 	for rows.Next() {
-		var r FTSSearchResult
-		var id int64
-		var content string
-		if err := rows.Scan(&id, &content, &r.CreatedAt, &r.Role); err != nil {
+		r, content, err := t.scanContentRow(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		r.ID = fmt.Sprintf("%d", id)
-		r.Type = "message"
 		if pat != "" {
 			r.Snippet = CreateFallbackSnippet(content, terms)
 		} else {
-			if len(content) > 80 {
-				r.Snippet = content[:77] + "..."
-			} else {
-				r.Snippet = content
-			}
+			r.Snippet = truncateRunes(content, 80)
 		}
 		results = append(results, r)
 	}
 	return results, rows.Err()
 }
 
-func (s *Store) searchSummariesLike(p SearchParams) ([]FTSSearchResult, error) {
-	pat := likePattern(p.Query)
-	var where []string
-	var args []interface{}
-
-	if p.WorkspaceID > 0 {
-		where = append(where, "s.workspace_id = ?")
-		args = append(args, p.WorkspaceID)
-	}
-	if pat != "" {
-		where = append(where, "s.content LIKE ?")
-		args = append(args, pat)
-	}
-	appendTimeFilters(&where, &args, "s", p.Since, p.Before)
-
-	whereClause := ""
-	if len(where) > 0 {
-		whereClause = "WHERE " + strings.Join(where, " AND ")
-	}
-	args = append(args, p.Limit)
-
-	query := fmt.Sprintf(
-		`SELECT s.id, s.content, s.created_at
-		 FROM summaries s %s
-		 ORDER BY s.created_at DESC
-		 LIMIT ?`, whereClause,
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("searching summaries LIKE: %w", err)
-	}
-	defer rows.Close()
-
-	terms := strings.Fields(strings.TrimSpace(p.Query))
-	var results []FTSSearchResult
-	for rows.Next() {
-		var r FTSSearchResult
-		var content string
-		if err := rows.Scan(&r.ID, &content, &r.CreatedAt); err != nil {
-			return nil, err
-		}
-		r.Type = "summary"
-		if pat != "" {
-			r.Snippet = CreateFallbackSnippet(content, terms)
-		} else {
-			if len(content) > 80 {
-				r.Snippet = content[:77] + "..."
-			} else {
-				r.Snippet = content
-			}
-		}
-		results = append(results, r)
-	}
-	return results, rows.Err()
-}
-
-// ---------------------------------------------------------------------------
-// Regex search
-// ---------------------------------------------------------------------------
-
+// searchRegex fetches up to regexScanLimit rows and filters with Go regexp.
 const regexScanLimit = 10000
 
-// SearchMessagesRegex performs regex matching in Go after fetching rows.
-func (s *Store) SearchMessagesRegex(p SearchParams) ([]FTSSearchResult, error) {
+func (s *Store) searchRegex(t searchTarget, p SearchParams) ([]FTSSearchResult, error) {
 	re, err := regexp.Compile(p.Query)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex: %w", err)
@@ -784,10 +614,10 @@ func (s *Store) SearchMessagesRegex(p SearchParams) ([]FTSSearchResult, error) {
 	var where []string
 	var args []interface{}
 	if p.WorkspaceID > 0 {
-		where = append(where, "m.workspace_id = ?")
+		where = append(where, fmt.Sprintf("%s.workspace_id = ?", t.alias))
 		args = append(args, p.WorkspaceID)
 	}
-	appendTimeFilters(&where, &args, "m", p.Since, p.Before)
+	appendTimeFilters(&where, &args, t.alias, p.Since, p.Before)
 	args = append(args, regexScanLimit)
 
 	whereClause := ""
@@ -795,202 +625,50 @@ func (s *Store) SearchMessagesRegex(p SearchParams) ([]FTSSearchResult, error) {
 		whereClause = "WHERE " + strings.Join(where, " AND ")
 	}
 
-	query := fmt.Sprintf(
-		`SELECT m.id, m.content, m.created_at, m.role
-		 FROM messages m %s
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`, whereClause,
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s %s %s ORDER BY %s.created_at DESC LIMIT ?`,
+		t.selectContent(), t.table, t.alias, whereClause, t.alias,
 	)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("regex scan messages: %w", err)
+		return nil, fmt.Errorf("regex scan %s: %w", t.table, err)
 	}
 	defer rows.Close()
 
 	var results []FTSSearchResult
-	for rows.Next() && len(results) < p.Limit {
-		var id int64
-		var content, role string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &content, &createdAt, &role); err != nil {
+	for rows.Next() {
+		if len(results) >= p.Limit {
+			break
+		}
+		r, content, err := t.scanContentRow(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		loc := re.FindStringIndex(content)
 		if loc == nil {
 			continue
 		}
-		// Build snippet around the match
-		start := loc[0] - 24
-		if start < 0 {
-			start = 0
-		}
-		end := loc[1] + 40
-		if end > len(content) {
-			end = len(content)
-		}
-		prefix := ""
-		if start > 0 {
-			prefix = "..."
-		}
-		suffix := ""
-		if end < len(content) {
-			suffix = "..."
-		}
-		results = append(results, FTSSearchResult{
-			ID:        fmt.Sprintf("%d", id),
-			Type:      "message",
-			Snippet:   prefix + strings.TrimSpace(content[start:end]) + suffix,
-			CreatedAt: createdAt,
-			Role:      role,
-		})
-	}
-	return results, rows.Err()
-}
-
-// SearchSummariesRegex performs regex matching in Go after fetching rows.
-func (s *Store) SearchSummariesRegex(p SearchParams) ([]FTSSearchResult, error) {
-	re, err := regexp.Compile(p.Query)
-	if err != nil {
-		return nil, fmt.Errorf("invalid regex: %w", err)
-	}
-
-	var where []string
-	var args []interface{}
-	if p.WorkspaceID > 0 {
-		where = append(where, "s.workspace_id = ?")
-		args = append(args, p.WorkspaceID)
-	}
-	appendTimeFilters(&where, &args, "s", p.Since, p.Before)
-	args = append(args, regexScanLimit)
-
-	whereClause := ""
-	if len(where) > 0 {
-		whereClause = "WHERE " + strings.Join(where, " AND ")
-	}
-
-	query := fmt.Sprintf(
-		`SELECT s.id, s.content, s.created_at
-		 FROM summaries s %s
-		 ORDER BY s.created_at DESC
-		 LIMIT ?`, whereClause,
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("regex scan summaries: %w", err)
-	}
-	defer rows.Close()
-
-	var results []FTSSearchResult
-	for rows.Next() && len(results) < p.Limit {
-		var id, content string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &content, &createdAt); err != nil {
-			return nil, err
-		}
-		loc := re.FindStringIndex(content)
-		if loc == nil {
-			continue
-		}
-		start := loc[0] - 24
-		if start < 0 {
-			start = 0
-		}
-		end := loc[1] + 40
-		if end > len(content) {
-			end = len(content)
-		}
-		prefix := ""
-		if start > 0 {
-			prefix = "..."
-		}
-		suffix := ""
-		if end < len(content) {
-			suffix = "..."
-		}
-		results = append(results, FTSSearchResult{
-			ID:        id,
-			Type:      "summary",
-			Snippet:   prefix + strings.TrimSpace(content[start:end]) + suffix,
-			CreatedAt: createdAt,
-		})
-	}
-	return results, rows.Err()
-}
-
-// ---------------------------------------------------------------------------
-// Row scanners
-// ---------------------------------------------------------------------------
-
-func scanMessagesFTS(rows interface {
-	Next() bool
-	Scan(...interface{}) error
-	Err() error
-}) ([]FTSSearchResult, error) {
-	var results []FTSSearchResult
-	for rows.Next() {
-		var r FTSSearchResult
-		var id int64
-		if err := rows.Scan(&id, &r.Snippet, &r.CreatedAt, &r.Role, &r.Rank); err != nil {
-			return nil, err
-		}
-		r.ID = fmt.Sprintf("%d", id)
-		r.Type = "message"
+		r.Snippet = safeSnippet(content, loc[0], loc[1], 16, 30)
 		results = append(results, r)
 	}
 	return results, rows.Err()
 }
 
-func scanSummariesFTS(rows interface {
-	Next() bool
-	Scan(...interface{}) error
-	Err() error
-}) ([]FTSSearchResult, error) {
-	var results []FTSSearchResult
-	for rows.Next() {
-		var r FTSSearchResult
-		if err := rows.Scan(&r.ID, &r.Snippet, &r.CreatedAt, &r.Rank); err != nil {
-			return nil, err
-		}
-		r.Type = "summary"
-		results = append(results, r)
-	}
-	return results, rows.Err()
-}
+// === Result merging =========================================================
 
-// ---------------------------------------------------------------------------
-// MergeResults sorts and truncates combined results.
-// ---------------------------------------------------------------------------
-
-// MergeResults merges message and summary results with sort-aware ordering.
-func MergeResults(results []FTSSearchResult, sort string, limit int) []FTSSearchResult {
-	// Sort based on mode
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			swap := false
-			switch sort {
-			case "recency":
-				swap = results[j].CreatedAt.After(results[i].CreatedAt)
-			case "hybrid":
-				// Approximate: use rank as primary, recency as tiebreaker
-				if results[j].Rank != results[i].Rank {
-					swap = results[j].Rank < results[i].Rank
-				} else {
-					swap = results[j].CreatedAt.After(results[i].CreatedAt)
-				}
-			default: // relevance
-				if results[j].Rank != results[i].Rank {
-					swap = results[j].Rank < results[i].Rank
-				} else {
-					swap = results[j].CreatedAt.After(results[i].CreatedAt)
-				}
-			}
-			if swap {
-				results[i], results[j] = results[j], results[i]
-			}
+// MergeResults sorts and truncates combined message+summary results.
+func MergeResults(results []FTSSearchResult, sortMode string, limit int) []FTSSearchResult {
+	sort.Slice(results, func(i, j int) bool {
+		if sortMode == "recency" {
+			return results[i].CreatedAt.After(results[j].CreatedAt)
 		}
-	}
+		// relevance / hybrid: rank primary, recency tiebreaker
+		if results[i].Rank != results[j].Rank {
+			return results[i].Rank < results[j].Rank
+		}
+		return results[i].CreatedAt.After(results[j].CreatedAt)
+	})
 	if len(results) > limit {
 		results = results[:limit]
 	}
