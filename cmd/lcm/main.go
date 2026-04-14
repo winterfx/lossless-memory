@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/winter-wang/lossless-memory/internal/config"
 	"github.com/winter-wang/lossless-memory/internal/db"
@@ -99,8 +101,35 @@ func runIngest() {
 	}
 }
 
+// acquireLock acquires an exclusive file lock for digest operations.
+// Blocks until the lock is available, preventing concurrent digests.
+func acquireLock() (*os.File, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting home dir: %w", err)
+	}
+	lockPath := filepath.Join(home, ".claude", "lcm.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("opening lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("acquiring lock: %w", err)
+	}
+	return f, nil
+}
+
 func runDigest() {
 	h := readHookInput()
+
+	lock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[lcm] lock error: %v\n", err)
+		os.Exit(1)
+	}
+	defer lock.Close()
+
 	store := openStore()
 	defer store.Close()
 

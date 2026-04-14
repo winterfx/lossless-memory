@@ -231,7 +231,7 @@ lossless-memory 通过两种方式与 Claude Code 集成：
         "hooks": [
           {
             "type": "command",
-            "command": "lcm digest"
+            "command": "bash -c 'input=$(cat); printf \"%s\" \"$input\" | lcm digest &>/dev/null &'"
           }
         ]
       }
@@ -242,7 +242,7 @@ lossless-memory 通过两种方式与 Claude Code 集成：
         "hooks": [
           {
             "type": "command",
-            "command": "lcm digest"
+            "command": "bash -c 'input=$(cat); printf \"%s\" \"$input\" | lcm digest &>/dev/null &'"
           }
         ]
       }
@@ -251,11 +251,18 @@ lossless-memory 通过两种方式与 Claude Code 集成：
 }
 ```
 
-| Hook 事件 | 命令 | 作用 |
-|-----------|------|------|
-| `SessionStart` | `lcm overview` | 从最高层摘要生成上下文，注入到新会话中 |
-| `SessionEnd` | `lcm digest` | 增量解析 transcript，创建叶子摘要 + 向上凝缩 |
-| `Stop` | `lcm digest` | 每次 Claude 停止响应时刷新记忆（可选，保证长会话不丢数据）|
+| Hook 事件 | 命令 | 同步/异步 | 作用 |
+|-----------|------|:---------:|------|
+| `SessionStart` | `lcm overview` | 同步 | Claude 必须等拿到 `additionalContext` 才能开始会话 |
+| `SessionEnd` | `lcm digest` | **异步** | 会话已结束，无需阻塞；含 `forceFlush` 确保剩余消息被摘要 |
+| `Stop` | `lcm digest` | **异步** | 每次 Claude 停止响应时刷新记忆，不阻塞用户继续输入 |
+
+异步实现原理：`bash -c 'input=$(cat); printf "%s" "$input" | lcm digest &>/dev/null &'`
+- `$(cat)` 立即读完 stdin（小段 JSON）
+- `printf ... | lcm digest` 在后台运行
+- bash 立即退出（exit 0），Claude Code 不阻塞
+
+`lcm digest` 内部使用 `flock` 排他锁（`~/.claude/lcm.lock`），当多个 digest 并发触发时（如 `Stop` 紧接 `SessionEnd`），后到的进程会等待前一个完成再执行，保证不丢数据。
 
 Hook 通过 stdin/stdout 的 JSON 协议通信：
 
