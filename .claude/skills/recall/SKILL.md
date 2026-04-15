@@ -27,6 +27,10 @@ lcm recall search --cwd "$(pwd)" --query "<search terms>" \
 - `--query` — search text (required)
 - `--mode` — `full_text` (default, FTS5 + CJK trigram) or `regex` (Go regex matching)
 - `--scope` — `both` (default), `messages`, or `summaries`
+  - Always start with `both` (default). Do not narrow scope preemptively.
+  - Use `messages` when searching for verbatim content: exact commands, code snippets, error messages, URLs.
+  - Use `summaries` when searching for decisions, conclusions, or high-level context.
+  - Only switch from `both` when results are too noisy and you need to filter.
 - `--sort` — `relevance` (default, BM25 rank), `recency` (newest first), or `hybrid` (time-decayed relevance)
 - `--since` / `--before` — ISO datetime range filter
 - `--all` — search across all workspaces
