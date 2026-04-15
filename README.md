@@ -2,6 +2,8 @@
 
 Claude Code session memory that never forgets.
 
+![lossless-memory](lossless-memory-notes.png)
+
 ## The problem
 
 Claude Code conversations are ephemeral. Every session starts with a blank slate — previous decisions, debugging history, and project context are gone. The built-in context window compresses or drops older content as conversations grow, silently losing information you might need later.
